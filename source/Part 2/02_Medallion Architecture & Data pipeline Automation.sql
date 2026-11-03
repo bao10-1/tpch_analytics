@@ -1,0 +1,631 @@
+-- =====================================================================
+-- PHẦN 2: MEDALLION DATA PIPELINE & AUTOMATION (STREAMS & TASKS)
+-- File: 02_medallion_data_pipeline_automation.sql
+-- =====================================================================
+
+USE ROLE TPCH_DEVELOPER;
+USE WAREHOUSE TPCH_WH;
+USE DATABASE TPCH_ANALYTICS_DB;
+
+-- ---------------------------------------------------------------------
+-- 2.1 KIỂM TRA BRONZE LAYER (RAW DATA TỪ STAGING)
+-- ---------------------------------------------------------------------
+USE SCHEMA STAGING;
+
+SELECT 'ORDERS' AS TABLE_NAME, COUNT(*) AS ROW_COUNT FROM ORDERS
+UNION ALL
+SELECT 'CUSTOMER', COUNT(*) FROM CUSTOMER
+UNION ALL
+SELECT 'LINEITEM', COUNT(*) FROM LINEITEM;
+
+
+-- ---------------------------------------------------------------------
+-- 2.2 TẠO CÁC BẢNG SILVER LAYER (CLEANED & ENRICHED)
+-- ---------------------------------------------------------------------
+USE SCHEMA ANALYTICS;
+
+-- Bảng ORDERS_SILVER
+CREATE OR REPLACE TABLE ORDERS_SILVER (
+    O_ORDERKEY          NUMBER(38,0) PRIMARY KEY,
+    O_CUSTKEY           NUMBER(38,0),
+    O_ORDERSTATUS       VARCHAR(1),
+    O_ORDERSTATUS_DESC  VARCHAR(20),       -- Enriched
+    O_TOTALPRICE        NUMBER(12,2),
+    O_ORDERDATE         DATE,
+    O_ORDER_YEAR        NUMBER(4,0),       -- Derived
+    O_ORDER_MONTH       NUMBER(2,0),       -- Derived
+    O_ORDER_QUARTER     NUMBER(1,0),       -- Derived
+    O_ORDERPRIORITY     VARCHAR(15),
+    O_PRIORITY_RANK     NUMBER(1,0),       -- Derived
+    O_CLERK             VARCHAR(15),
+    O_CLERK_ID          NUMBER(9,0),       -- Derived
+    O_SHIPPRIORITY      NUMBER(38,0),
+    O_COMMENT           VARCHAR(79),
+    -- Metadata columns
+    SOURCE_FILE         VARCHAR(256),
+    FIRST_LOADED_AT     TIMESTAMP_NTZ,
+    LAST_UPDATED_AT     TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- Bảng CUSTOMER_SILVER
+CREATE OR REPLACE TABLE CUSTOMER_SILVER (
+    C_CUSTKEY           NUMBER(38,0) PRIMARY KEY,
+    C_NAME              VARCHAR(25),
+    C_ADDRESS           VARCHAR(40),
+    C_NATIONKEY         NUMBER(38,0),
+    C_NATION_NAME       VARCHAR(25),       -- Joined from NATION
+    C_REGIONKEY         NUMBER(38,0),       -- Joined from NATION -> REGION
+    C_REGION_NAME       VARCHAR(25),       -- Joined from REGION
+    C_PHONE             VARCHAR(15),
+    C_ACCTBAL           NUMBER(12,2),
+    C_MKTSEGMENT        VARCHAR(10),
+    C_COMMENT           VARCHAR(117),
+    LOAD_TIMESTAMP      TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- Bảng LINEITEM_SILVER
+CREATE OR REPLACE TABLE LINEITEM_SILVER (
+    L_ORDERKEY          NUMBER(38,0),
+    L_LINENUMBER        NUMBER(38,0),
+    L_PARTKEY           NUMBER(38,0),
+    L_PART_NAME         VARCHAR(55),       -- Joined from PART
+    L_PART_TYPE         VARCHAR(25),       -- Joined from PART
+    L_SUPPKEY           NUMBER(38,0),
+    L_SUPPLIER_NAME     VARCHAR(25),       -- Joined from SUPPLIER
+    L_QUANTITY          NUMBER(12,2),
+    L_EXTENDEDPRICE     NUMBER(12,2),
+    L_DISCOUNT          NUMBER(12,2),
+    L_TAX               NUMBER(12,2),
+    L_RETURNFLAG        VARCHAR(1),
+    L_LINESTATUS        VARCHAR(1),
+    L_SHIPDATE          DATE,
+    L_COMMITDATE        DATE,
+    L_RECEIPTDATE       DATE,
+    L_SHIPINSTRUCT      VARCHAR(25),
+    L_SHIPMODE          VARCHAR(10),
+    L_COMMENT           VARCHAR(44),
+    -- Calculated columns
+    L_NET_PRICE         NUMBER(12,2),      -- EXTENDEDPRICE * (1 - DISCOUNT)
+    L_FINAL_PRICE       NUMBER(12,2),      -- NET_PRICE * (1 + TAX)
+    L_SHIP_DELAY_DAYS   NUMBER(38,0),      -- Days between commit and receipt
+    LOAD_TIMESTAMP      TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    PRIMARY KEY (L_ORDERKEY, L_LINENUMBER)
+);
+
+
+-- ---------------------------------------------------------------------
+-- 2.3 TẠO CÁC BẢNG GOLD LAYER (AGGREGATED & BUSINESS METRICS)
+-- ---------------------------------------------------------------------
+
+-- Bảng DAILY_SALES_SUMMARY
+CREATE OR REPLACE TABLE DAILY_SALES_SUMMARY (
+    SUMMARY_DATE        DATE PRIMARY KEY,
+    ORDER_YEAR          NUMBER(4,0),
+    ORDER_MONTH         NUMBER(2,0),
+    ORDER_QUARTER       NUMBER(1,0),
+    TOTAL_ORDERS        NUMBER(38,0),
+    TOTAL_CUSTOMERS     NUMBER(38,0),
+    TOTAL_REVENUE       NUMBER(15,2),
+    AVG_ORDER_VALUE     NUMBER(15,2),
+    MIN_ORDER_VALUE     NUMBER(15,2),
+    MAX_ORDER_VALUE     NUMBER(15,2),
+    LOAD_TIMESTAMP      TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- Bảng CUSTOMER_LTV
+CREATE OR REPLACE TABLE CUSTOMER_LTV (
+    C_CUSTKEY               NUMBER(38,0) PRIMARY KEY,
+    C_NAME                  VARCHAR(25),
+    C_NATION_NAME           VARCHAR(25),
+    C_REGION_NAME           VARCHAR(25),
+    C_MKTSEGMENT            VARCHAR(10),
+    TOTAL_ORDERS            NUMBER(38,0),
+    TOTAL_SPENT             NUMBER(15,2),
+    AVG_ORDER_VALUE         NUMBER(15,2),
+    FIRST_ORDER_DATE        DATE,
+    LAST_ORDER_DATE         DATE,
+    CUSTOMER_TENURE_DAYS    NUMBER(38,0),
+    CUSTOMER_TIER           VARCHAR(20),   -- VIP, GOLD, SILVER, BRONZE, STANDARD
+    IS_ACTIVE               BOOLEAN,       -- Has order in last 90 days
+    LOAD_TIMESTAMP          TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+
+-- ---------------------------------------------------------------------
+-- THIẾT LẬP CDC STREAMS TRÊN BRONZE LAYER
+-- ---------------------------------------------------------------------
+USE SCHEMA STAGING;
+
+CREATE OR REPLACE STREAM ORDERS_STREAM ON TABLE ORDERS
+    APPEND_ONLY = FALSE
+    COMMENT = 'Bắt thay đổi CDC từ bảng Bronze ORDERS';
+
+CREATE OR REPLACE STREAM CUSTOMER_STREAM ON TABLE CUSTOMER
+    APPEND_ONLY = FALSE
+    COMMENT = 'Bắt thay đổi CDC từ bảng Bronze CUSTOMER';
+
+CREATE OR REPLACE STREAM LINEITEM_STREAM ON TABLE LINEITEM
+    APPEND_ONLY = FALSE
+    COMMENT = 'Bắt thay đổi CDC từ bảng Bronze LINEITEM';
+
+
+-- ---------------------------------------------------------------------
+-- 2.4 TẠO STORED PROCEDURES CHO TRANSFORMATION LOGIC
+-- ---------------------------------------------------------------------
+USE SCHEMA ANALYTICS;
+
+-- Procedure 1: Transform & Merge ORDERS (Bronze -> Silver)
+CREATE OR REPLACE PROCEDURE SP_TRANSFORM_ORDERS_SILVER()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+    MERGE INTO TPCH_ANALYTICS_DB.ANALYTICS.ORDERS_SILVER target
+    USING (
+        SELECT 
+            O_ORDERKEY,
+            O_CUSTKEY,
+            O_ORDERSTATUS,
+            CASE O_ORDERSTATUS
+                WHEN 'F' THEN 'Fulfilled'
+                WHEN 'O' THEN 'Open'
+                WHEN 'P' THEN 'Pending'
+                ELSE 'Unknown'
+            END AS O_ORDERSTATUS_DESC,
+            O_TOTALPRICE,
+            O_ORDERDATE,
+            YEAR(O_ORDERDATE) AS O_ORDER_YEAR,
+            MONTH(O_ORDERDATE) AS O_ORDER_MONTH,
+            QUARTER(O_ORDERDATE) AS O_ORDER_QUARTER,
+            O_ORDERPRIORITY,
+            CASE 
+                WHEN O_ORDERPRIORITY LIKE '1%' THEN 1
+                WHEN O_ORDERPRIORITY LIKE '2%' THEN 2
+                WHEN O_ORDERPRIORITY LIKE '3%' THEN 3
+                WHEN O_ORDERPRIORITY LIKE '4%' THEN 4
+                WHEN O_ORDERPRIORITY LIKE '5%' THEN 5
+                ELSE 9
+            END AS O_PRIORITY_RANK,
+            O_CLERK,
+            TRY_TO_NUMBER(REGEXP_SUBSTR(O_CLERK, '\\d+')) AS O_CLERK_ID,
+            O_SHIPPRIORITY,
+            O_COMMENT,
+            'orders.csv' AS SOURCE_FILE,
+            METADATA$ACTION,
+            METADATA$ISUPDATE
+        FROM TPCH_ANALYTICS_DB.STAGING.ORDERS_STREAM
+    ) src
+    ON target.O_ORDERKEY = src.O_ORDERKEY
+    WHEN MATCHED AND src.METADATA$ACTION = 'DELETE' AND src.METADATA$ISUPDATE = FALSE THEN
+        DELETE
+    WHEN MATCHED AND src.METADATA$ACTION = 'INSERT' AND src.METADATA$ISUPDATE = TRUE THEN
+        UPDATE SET
+            target.O_CUSTKEY          = src.O_CUSTKEY,
+            target.O_ORDERSTATUS      = src.O_ORDERSTATUS,
+            target.O_ORDERSTATUS_DESC = src.O_ORDERSTATUS_DESC,
+            target.O_TOTALPRICE       = src.O_TOTALPRICE,
+            target.O_ORDERDATE        = src.O_ORDERDATE,
+            target.O_ORDER_YEAR       = src.O_ORDER_YEAR,
+            target.O_ORDER_MONTH      = src.O_ORDER_MONTH,
+            target.O_ORDER_QUARTER    = src.O_ORDER_QUARTER,
+            target.O_ORDERPRIORITY    = src.O_ORDERPRIORITY,
+            target.O_PRIORITY_RANK    = src.O_PRIORITY_RANK,
+            target.O_CLERK            = src.O_CLERK,
+            target.O_CLERK_ID         = src.O_CLERK_ID,
+            target.O_SHIPPRIORITY     = src.O_SHIPPRIORITY,
+            target.O_COMMENT          = src.O_COMMENT,
+            target.LAST_UPDATED_AT    = CURRENT_TIMESTAMP()
+    WHEN NOT MATCHED AND src.METADATA$ACTION = 'INSERT' THEN
+        INSERT (
+            O_ORDERKEY, O_CUSTKEY, O_ORDERSTATUS, O_ORDERSTATUS_DESC,
+            O_TOTALPRICE, O_ORDERDATE, O_ORDER_YEAR, O_ORDER_MONTH,
+            O_ORDER_QUARTER, O_ORDERPRIORITY, O_PRIORITY_RANK,
+            O_CLERK, O_CLERK_ID, O_SHIPPRIORITY, O_COMMENT,
+            SOURCE_FILE, FIRST_LOADED_AT, LAST_UPDATED_AT
+        )
+        VALUES (
+            src.O_ORDERKEY, src.O_CUSTKEY, src.O_ORDERSTATUS, src.O_ORDERSTATUS_DESC,
+            src.O_TOTALPRICE, src.O_ORDERDATE, src.O_ORDER_YEAR, src.O_ORDER_MONTH,
+            src.O_ORDER_QUARTER, src.O_ORDERPRIORITY, src.O_PRIORITY_RANK,
+            src.O_CLERK, src.O_CLERK_ID, src.O_SHIPPRIORITY, src.O_COMMENT,
+            src.SOURCE_FILE, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
+        );
+    RETURN 'SUCCESS: ORDERS_SILVER updated successfully.';
+END;
+$$;
+
+-- Procedure 2: Transform & Merge CUSTOMER (Bronze -> Silver)
+CREATE OR REPLACE PROCEDURE SP_TRANSFORM_CUSTOMER_SILVER()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+    MERGE INTO TPCH_ANALYTICS_DB.ANALYTICS.CUSTOMER_SILVER target
+    USING (
+        SELECT 
+            c.C_CUSTKEY,
+            c.C_NAME,
+            c.C_ADDRESS,
+            c.C_NATIONKEY,
+            n.N_NAME AS C_NATION_NAME,
+            r.R_REGIONKEY AS C_REGIONKEY,
+            r.R_NAME AS C_REGION_NAME,
+            c.C_PHONE,
+            c.C_ACCTBAL,
+            c.C_MKTSEGMENT,
+            c.C_COMMENT,
+            c.METADATA$ACTION,
+            c.METADATA$ISUPDATE
+        FROM TPCH_ANALYTICS_DB.STAGING.CUSTOMER_STREAM c
+        LEFT JOIN TPCH_ANALYTICS_DB.STAGING.NATION n ON c.C_NATIONKEY = n.N_NATIONKEY
+        LEFT JOIN TPCH_ANALYTICS_DB.STAGING.REGION r ON n.N_REGIONKEY = r.R_REGIONKEY
+    ) src
+    ON target.C_CUSTKEY = src.C_CUSTKEY
+    WHEN MATCHED AND src.METADATA$ACTION = 'DELETE' AND src.METADATA$ISUPDATE = FALSE THEN
+        DELETE
+    WHEN MATCHED AND src.METADATA$ACTION = 'INSERT' AND src.METADATA$ISUPDATE = TRUE THEN
+        UPDATE SET
+            target.C_NAME          = src.C_NAME,
+            target.C_ADDRESS       = src.C_ADDRESS,
+            target.C_NATIONKEY     = src.C_NATIONKEY,
+            target.C_NATION_NAME   = src.C_NATION_NAME,
+            target.C_REGIONKEY     = src.C_REGIONKEY,
+            target.C_REGION_NAME   = src.C_REGION_NAME,
+            target.C_PHONE         = src.C_PHONE,
+            target.C_ACCTBAL       = src.C_ACCTBAL,
+            target.C_MKTSEGMENT    = src.C_MKTSEGMENT,
+            target.C_COMMENT       = src.C_COMMENT,
+            target.LOAD_TIMESTAMP  = CURRENT_TIMESTAMP()
+    WHEN NOT MATCHED AND src.METADATA$ACTION = 'INSERT' THEN
+        INSERT (
+            C_CUSTKEY, C_NAME, C_ADDRESS, C_NATIONKEY, C_NATION_NAME,
+            C_REGIONKEY, C_REGION_NAME, C_PHONE, C_ACCTBAL,
+            C_MKTSEGMENT, C_COMMENT, LOAD_TIMESTAMP
+        )
+        VALUES (
+            src.C_CUSTKEY, src.C_NAME, src.C_ADDRESS, src.C_NATIONKEY, src.C_NATION_NAME,
+            src.C_REGIONKEY, src.C_REGION_NAME, src.C_PHONE, src.C_ACCTBAL,
+            src.C_MKTSEGMENT, src.C_COMMENT, CURRENT_TIMESTAMP()
+        );
+    RETURN 'SUCCESS: CUSTOMER_SILVER updated successfully.';
+END;
+$$;
+
+-- Procedure 3: Transform & Merge LINEITEM (Bronze -> Silver)
+CREATE OR REPLACE PROCEDURE SP_TRANSFORM_LINEITEM_SILVER()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+    MERGE INTO TPCH_ANALYTICS_DB.ANALYTICS.LINEITEM_SILVER target
+    USING (
+        SELECT 
+            l.L_ORDERKEY,
+            l.L_LINENUMBER,
+            l.L_PARTKEY,
+            p.P_NAME AS L_PART_NAME,
+            p.P_TYPE AS L_PART_TYPE,
+            l.L_SUPPKEY,
+            s.S_NAME AS L_SUPPLIER_NAME,
+            l.L_QUANTITY,
+            l.L_EXTENDEDPRICE,
+            l.L_DISCOUNT,
+            l.L_TAX,
+            l.L_RETURNFLAG,
+            l.L_LINESTATUS,
+            l.L_SHIPDATE,
+            l.L_COMMITDATE,
+            l.L_RECEIPTDATE,
+            l.L_SHIPINSTRUCT,
+            l.L_SHIPMODE,
+            l.L_COMMENT,
+            ROUND(l.L_EXTENDEDPRICE * (1 - l.L_DISCOUNT), 2) AS L_NET_PRICE,
+            ROUND((l.L_EXTENDEDPRICE * (1 - l.L_DISCOUNT)) * (1 + l.L_TAX), 2) AS L_FINAL_PRICE,
+            DATEDIFF('day', l.L_COMMITDATE, l.L_RECEIPTDATE) AS L_SHIP_DELAY_DAYS,
+            l.METADATA$ACTION,
+            l.METADATA$ISUPDATE
+        FROM TPCH_ANALYTICS_DB.STAGING.LINEITEM_STREAM l
+        LEFT JOIN TPCH_ANALYTICS_DB.STAGING.PART p ON l.L_PARTKEY = p.P_PARTKEY
+        LEFT JOIN TPCH_ANALYTICS_DB.STAGING.SUPPLIER s ON l.L_SUPPKEY = s.S_SUPPKEY
+    ) src
+    ON target.L_ORDERKEY = src.L_ORDERKEY AND target.L_LINENUMBER = src.L_LINENUMBER
+    WHEN MATCHED AND src.METADATA$ACTION = 'DELETE' AND src.METADATA$ISUPDATE = FALSE THEN
+        DELETE
+    WHEN MATCHED AND src.METADATA$ACTION = 'INSERT' AND src.METADATA$ISUPDATE = TRUE THEN
+        UPDATE SET
+            target.L_PARTKEY         = src.L_PARTKEY,
+            target.L_PART_NAME        = src.L_PART_NAME,
+            target.L_PART_TYPE        = src.L_PART_TYPE,
+            target.L_SUPPKEY         = src.L_SUPPKEY,
+            target.L_SUPPLIER_NAME    = src.L_SUPPLIER_NAME,
+            target.L_QUANTITY        = src.L_QUANTITY,
+            target.L_EXTENDEDPRICE   = src.L_EXTENDEDPRICE,
+            target.L_DISCOUNT        = src.L_DISCOUNT,
+            target.L_TAX             = src.L_TAX,
+            target.L_RETURNFLAG      = src.L_RETURNFLAG,
+            target.L_LINESTATUS      = src.L_LINESTATUS,
+            target.L_SHIPDATE        = src.L_SHIPDATE,
+            target.L_COMMITDATE      = src.L_COMMITDATE,
+            target.L_RECEIPTDATE     = src.L_RECEIPTDATE,
+            target.L_SHIPINSTRUCT    = src.L_SHIPINSTRUCT,
+            target.L_SHIPMODE        = src.L_SHIPMODE,
+            target.L_COMMENT         = src.L_COMMENT,
+            target.L_NET_PRICE       = src.L_NET_PRICE,
+            target.L_FINAL_PRICE     = src.L_FINAL_PRICE,
+            target.L_SHIP_DELAY_DAYS = src.L_SHIP_DELAY_DAYS,
+            target.LOAD_TIMESTAMP    = CURRENT_TIMESTAMP()
+    WHEN NOT MATCHED AND src.METADATA$ACTION = 'INSERT' THEN
+        INSERT (
+            L_ORDERKEY, L_LINENUMBER, L_PARTKEY, L_PART_NAME, L_PART_TYPE,
+            L_SUPPKEY, L_SUPPLIER_NAME, L_QUANTITY, L_EXTENDEDPRICE, L_DISCOUNT,
+            L_TAX, L_RETURNFLAG, L_LINESTATUS, L_SHIPDATE, L_COMMITDATE,
+            L_RECEIPTDATE, L_SHIPINSTRUCT, L_SHIPMODE, L_COMMENT,
+            L_NET_PRICE, L_FINAL_PRICE, L_SHIP_DELAY_DAYS, LOAD_TIMESTAMP
+        )
+        VALUES (
+            src.L_ORDERKEY, src.L_LINENUMBER, src.L_PARTKEY, src.L_PART_NAME, src.L_PART_TYPE,
+            src.L_SUPPKEY, src.L_SUPPLIER_NAME, src.L_QUANTITY, src.L_EXTENDEDPRICE, src.L_DISCOUNT,
+            src.L_TAX, src.L_RETURNFLAG, src.L_LINESTATUS, src.L_SHIPDATE, src.L_COMMITDATE,
+            src.L_RECEIPTDATE, src.L_SHIPINSTRUCT, src.L_SHIPMODE, src.L_COMMENT,
+            src.L_NET_PRICE, src.L_FINAL_PRICE, src.L_SHIP_DELAY_DAYS, CURRENT_TIMESTAMP()
+        );
+    RETURN 'SUCCESS: LINEITEM_SILVER updated successfully.';
+END;
+$$;
+
+-- Procedure 4: Transform Silver -> Gold (Customer LTV)
+CREATE OR REPLACE PROCEDURE SP_CALCULATE_CUSTOMER_LTV()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+    CREATE OR REPLACE TABLE TPCH_ANALYTICS_DB.ANALYTICS.CUSTOMER_LTV AS
+    SELECT 
+        cs.C_CUSTKEY,
+        cs.C_NAME,
+        cs.C_NATION_NAME,
+        cs.C_REGION_NAME,
+        cs.C_MKTSEGMENT,
+        COUNT(os.O_ORDERKEY) AS TOTAL_ORDERS,
+        COALESCE(SUM(os.O_TOTALPRICE), 0) AS TOTAL_SPENT,
+        COALESCE(ROUND(AVG(os.O_TOTALPRICE), 2), 0) AS AVG_ORDER_VALUE,
+        MIN(os.O_ORDERDATE) AS FIRST_ORDER_DATE,
+        MAX(os.O_ORDERDATE) AS LAST_ORDER_DATE,
+        COALESCE(DATEDIFF('day', MIN(os.O_ORDERDATE), MAX(os.O_ORDERDATE)), 0) AS CUSTOMER_TENURE_DAYS,
+        CASE
+            WHEN SUM(os.O_TOTALPRICE) >= 500000 THEN 'VIP'
+            WHEN SUM(os.O_TOTALPRICE) >= 200000 THEN 'GOLD'
+            WHEN SUM(os.O_TOTALPRICE) >= 100000 THEN 'SILVER'
+            WHEN SUM(os.O_TOTALPRICE) >= 50000  THEN 'BRONZE'
+            ELSE 'STANDARD'
+        END AS CUSTOMER_TIER,
+        COALESCE(MAX(os.O_ORDERDATE) >= DATEADD('day', -90, CURRENT_DATE()), FALSE) AS IS_ACTIVE,
+        CURRENT_TIMESTAMP() AS LOAD_TIMESTAMP
+    FROM TPCH_ANALYTICS_DB.ANALYTICS.CUSTOMER_SILVER cs
+    LEFT JOIN TPCH_ANALYTICS_DB.ANALYTICS.ORDERS_SILVER os ON cs.C_CUSTKEY = os.O_CUSTKEY
+    GROUP BY 
+        cs.C_CUSTKEY, cs.C_NAME, cs.C_NATION_NAME, cs.C_REGION_NAME, cs.C_MKTSEGMENT;
+
+    RETURN 'SUCCESS: CUSTOMER_LTV calculated successfully.';
+END;
+$$;
+
+-- Procedure 5: Transform Silver -> Gold (Daily Sales Summary)
+CREATE OR REPLACE PROCEDURE SP_CALCULATE_DAILY_SALES_SUMMARY()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+    CREATE OR REPLACE TABLE TPCH_ANALYTICS_DB.ANALYTICS.DAILY_SALES_SUMMARY AS
+    SELECT 
+        O_ORDERDATE AS SUMMARY_DATE,
+        O_ORDER_YEAR AS ORDER_YEAR,
+        O_ORDER_MONTH AS ORDER_MONTH,
+        O_ORDER_QUARTER AS ORDER_QUARTER,
+        COUNT(DISTINCT O_ORDERKEY) AS TOTAL_ORDERS,
+        COUNT(DISTINCT O_CUSTKEY) AS TOTAL_CUSTOMERS,
+        SUM(O_TOTALPRICE) AS TOTAL_REVENUE,
+        ROUND(AVG(O_TOTALPRICE), 2) AS AVG_ORDER_VALUE,
+        MIN(O_TOTALPRICE) AS MIN_ORDER_VALUE,
+        MAX(O_TOTALPRICE) AS MAX_ORDER_VALUE,
+        CURRENT_TIMESTAMP() AS LOAD_TIMESTAMP
+    FROM TPCH_ANALYTICS_DB.ANALYTICS.ORDERS_SILVER
+    WHERE O_ORDERDATE IS NOT NULL
+    GROUP BY 
+        O_ORDERDATE, O_ORDER_YEAR, O_ORDER_MONTH, O_ORDER_QUARTER;
+
+    RETURN 'SUCCESS: DAILY_SALES_SUMMARY calculated successfully.';
+END;
+$$;
+
+
+-- ---------------------------------------------------------------------
+-- KHỞI TẠO DỮ LIỆU BAN ĐẦU (INITIAL BACKFILL) CHO SILVER & GOLD
+-- ---------------------------------------------------------------------
+
+-- Backfill CUSTOMER_SILVER
+INSERT OVERWRITE INTO TPCH_ANALYTICS_DB.ANALYTICS.CUSTOMER_SILVER
+SELECT 
+    c.C_CUSTKEY,
+    c.C_NAME,
+    c.C_ADDRESS,
+    c.C_NATIONKEY,
+    n.N_NAME AS C_NATION_NAME,
+    r.R_REGIONKEY AS C_REGIONKEY,
+    r.R_NAME AS C_REGION_NAME,
+    c.C_PHONE,
+    c.C_ACCTBAL,
+    c.C_MKTSEGMENT,
+    c.C_COMMENT,
+    CURRENT_TIMESTAMP() AS LOAD_TIMESTAMP
+FROM TPCH_ANALYTICS_DB.STAGING.CUSTOMER c
+LEFT JOIN TPCH_ANALYTICS_DB.STAGING.NATION n ON c.C_NATIONKEY = n.N_NATIONKEY
+LEFT JOIN TPCH_ANALYTICS_DB.STAGING.REGION r ON n.N_REGIONKEY = r.R_REGIONKEY;
+
+-- Backfill ORDERS_SILVER
+INSERT OVERWRITE INTO TPCH_ANALYTICS_DB.ANALYTICS.ORDERS_SILVER
+SELECT 
+    O_ORDERKEY,
+    O_CUSTKEY,
+    O_ORDERSTATUS,
+    CASE O_ORDERSTATUS
+        WHEN 'F' THEN 'Fulfilled'
+        WHEN 'O' THEN 'Open'
+        WHEN 'P' THEN 'Pending'
+        ELSE 'Unknown'
+    END AS O_ORDERSTATUS_DESC,
+    O_TOTALPRICE,
+    O_ORDERDATE,
+    YEAR(O_ORDERDATE) AS O_ORDER_YEAR,
+    MONTH(O_ORDERDATE) AS O_ORDER_MONTH,
+    QUARTER(O_ORDERDATE) AS O_ORDER_QUARTER,
+    O_ORDERPRIORITY,
+    CASE 
+        WHEN O_ORDERPRIORITY LIKE '1%' THEN 1
+        WHEN O_ORDERPRIORITY LIKE '2%' THEN 2
+        WHEN O_ORDERPRIORITY LIKE '3%' THEN 3
+        WHEN O_ORDERPRIORITY LIKE '4%' THEN 4
+        WHEN O_ORDERPRIORITY LIKE '5%' THEN 5
+        ELSE 9
+    END AS O_PRIORITY_RANK,
+    O_CLERK,
+    TRY_TO_NUMBER(REGEXP_SUBSTR(O_CLERK, '\\d+')) AS O_CLERK_ID,
+    O_SHIPPRIORITY,
+    O_COMMENT,
+    'orders.csv' AS SOURCE_FILE,
+    CURRENT_TIMESTAMP() AS FIRST_LOADED_AT,
+    CURRENT_TIMESTAMP() AS LAST_UPDATED_AT
+FROM TPCH_ANALYTICS_DB.STAGING.ORDERS;
+
+-- Backfill LINEITEM_SILVER
+INSERT OVERWRITE INTO TPCH_ANALYTICS_DB.ANALYTICS.LINEITEM_SILVER
+SELECT 
+    l.L_ORDERKEY,
+    l.L_LINENUMBER,
+    l.L_PARTKEY,
+    p.P_NAME AS L_PART_NAME,
+    p.P_TYPE AS L_PART_TYPE,
+    l.L_SUPPKEY,
+    s.S_NAME AS L_SUPPLIER_NAME,
+    l.L_QUANTITY,
+    l.L_EXTENDEDPRICE,
+    l.L_DISCOUNT,
+    l.L_TAX,
+    l.L_RETURNFLAG,
+    l.L_LINESTATUS,
+    l.L_SHIPDATE,
+    l.L_COMMITDATE,
+    l.L_RECEIPTDATE,
+    l.L_SHIPINSTRUCT,
+    l.L_SHIPMODE,
+    l.L_COMMENT,
+    ROUND(l.L_EXTENDEDPRICE * (1 - l.L_DISCOUNT), 2) AS L_NET_PRICE,
+    ROUND((l.L_EXTENDEDPRICE * (1 - l.L_DISCOUNT)) * (1 + l.L_TAX), 2) AS L_FINAL_PRICE,
+    DATEDIFF('day', l.L_COMMITDATE, l.L_RECEIPTDATE) AS L_SHIP_DELAY_DAYS,
+    CURRENT_TIMESTAMP() AS LOAD_TIMESTAMP
+FROM TPCH_ANALYTICS_DB.STAGING.LINEITEM l
+LEFT JOIN TPCH_ANALYTICS_DB.STAGING.PART p ON l.L_PARTKEY = p.P_PARTKEY
+LEFT JOIN TPCH_ANALYTICS_DB.STAGING.SUPPLIER s ON l.L_SUPPKEY = s.S_SUPPKEY;
+
+-- Khởi tạo ban đầu cho Gold Layer
+CALL SP_CALCULATE_CUSTOMER_LTV();
+CALL SP_CALCULATE_DAILY_SALES_SUMMARY();
+
+
+-- ---------------------------------------------------------------------
+-- 2.5 TẠO VÀ LẬP LỊCH TASKS TỰ ĐỘNG HÓA PIPELINE
+-- ---------------------------------------------------------------------
+USE ROLE ACCOUNTADMIN;
+GRANT EXECUTE TASK ON ACCOUNT TO ROLE TPCH_DEVELOPER;
+USE ROLE TPCH_DEVELOPER;
+
+USE SCHEMA ANALYTICS;
+
+-- Task 1: Bronze -> Silver (Orders Incremental via Stream)
+CREATE OR REPLACE TASK TASK_BRONZE_TO_SILVER_ORDERS
+    WAREHOUSE = TPCH_WH
+    SCHEDULE = '5 MINUTE'
+    WHEN SYSTEM$STREAM_HAS_DATA('TPCH_ANALYTICS_DB.STAGING.ORDERS_STREAM')
+AS
+    CALL SP_TRANSFORM_ORDERS_SILVER();
+
+-- Task 2: Bronze -> Silver (Customers Incremental via Stream)
+CREATE OR REPLACE TASK TASK_BRONZE_TO_SILVER_CUSTOMERS
+    WAREHOUSE = TPCH_WH
+    AFTER TASK_BRONZE_TO_SILVER_ORDERS
+AS
+    CALL SP_TRANSFORM_CUSTOMER_SILVER();
+
+-- Task 3: Silver -> Gold (Customer LTV)
+CREATE OR REPLACE TASK TASK_SILVER_TO_GOLD_CUSTOMER_LTV
+    WAREHOUSE = TPCH_WH
+    AFTER TASK_BRONZE_TO_SILVER_CUSTOMERS
+AS
+    CALL SP_CALCULATE_CUSTOMER_LTV();
+
+-- Task 4: Silver -> Gold (Daily Sales Summary)
+CREATE OR REPLACE TASK TASK_SILVER_TO_GOLD_DAILY_SALES
+    WAREHOUSE = TPCH_WH
+    AFTER TASK_BRONZE_TO_SILVER_ORDERS
+AS
+    CALL SP_CALCULATE_DAILY_SALES_SUMMARY();
+
+-- Bật Tasks
+ALTER TASK TASK_SILVER_TO_GOLD_DAILY_SALES RESUME;
+ALTER TASK TASK_SILVER_TO_GOLD_CUSTOMER_LTV RESUME;
+ALTER TASK TASK_BRONZE_TO_SILVER_CUSTOMERS RESUME;
+ALTER TASK TASK_BRONZE_TO_SILVER_ORDERS RESUME;
+
+-- Kiểm tra trạng thái tasks
+SHOW TASKS IN SCHEMA TPCH_ANALYTICS_DB.ANALYTICS;
+
+
+-- ---------------------------------------------------------------------
+-- 2.6 MONITOR VÀ TEST PIPELINE TỰ ĐỘNG
+-- ---------------------------------------------------------------------
+
+-- TEST 1: Mô phỏng chèn thêm dữ liệu mới vào Bronze layer
+-- Kiểm tra file đã có trên Stage
+LIST @TPCH_ANALYTICS_DB.STAGING.TPCH_DATA_STAGE PATTERN = '.*orders_incremental.*';
+
+-- Nạp dữ liệu từ file orders_incremental.csv vào bảng Bronze ORDERS
+COPY INTO TPCH_ANALYTICS_DB.STAGING.ORDERS
+FROM @TPCH_ANALYTICS_DB.STAGING.TPCH_DATA_STAGE
+FILES = ('orders_incremental.csv')
+FILE_FORMAT = (FORMAT_NAME = TPCH_ANALYTICS_DB.STAGING.TPCH_CSV_FORMAT)
+ON_ERROR = 'CONTINUE';
+
+-- TEST 2: Kiểm tra Stream đã ghi nhận thay đổi CDC
+SELECT * FROM TPCH_ANALYTICS_DB.STAGING.ORDERS_STREAM;
+
+EXECUTE TASK TPCH_ANALYTICS_DB.ANALYTICS.TASK_BRONZE_TO_SILVER_ORDERS;
+
+-- TEST 3: Kiểm tra luồng dữ liệu đến Silver & Gold
+-- Kiểm tra Silver đã có đơn hàng mới
+SELECT * FROM TPCH_ANALYTICS_DB.ANALYTICS.ORDERS_SILVER WHERE O_ORDERKEY = 99999991;
+
+-- Kiểm tra Stream đã được giải phóng (bản ghi đã tiêu thụ)
+SELECT COUNT(*) AS UNCONSUMED_CHANGES FROM TPCH_ANALYTICS_DB.STAGING.ORDERS_STREAM;
+
+-- Kiểm tra bảng Gold cập nhật
+SELECT * FROM TPCH_ANALYTICS_DB.ANALYTICS.DAILY_SALES_SUMMARY WHERE SUMMARY_DATE = CURRENT_DATE();
+SELECT * FROM TPCH_ANALYTICS_DB.ANALYTICS.CUSTOMER_LTV WHERE C_CUSTKEY = 1001;
+
+-- TEST 4: Theo dõi lịch sử thực thi của các Tasks
+SELECT 
+    NAME,
+    STATE,
+    SCHEDULED_TIME,
+    COMPLETED_TIME,
+    ERROR_CODE,
+    ERROR_MESSAGE
+FROM TABLE(INFORMATION_SCHEMA.TASK_HISTORY(
+    SCHEDULED_TIME_RANGE_START => DATEADD('hour', -1, CURRENT_TIMESTAMP()),
+    RESULT_LIMIT => 20
+))
+ORDER BY SCHEDULED_TIME DESC;
